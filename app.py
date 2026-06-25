@@ -1,294 +1,248 @@
-import os
 import time
 from datetime import datetime, timezone
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
-import yfinance as yf
-from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="Garibaldi Crypto Prediction Bot v3", page_icon="₿", layout="wide")
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 
-DEFAULT_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD"]
-BINANCE_MAP = {
-    "BTC-USD": "BTCUSDT", "ETH-USD": "ETHUSDT", "SOL-USD": "SOLUSDT", "XRP-USD": "XRPUSDT",
-    "DOGE-USD": "DOGEUSDT", "ADA-USD": "ADAUSDT", "AVAX-USD": "AVAXUSDT", "LINK-USD": "LINKUSDT"
+st.set_page_config(page_title="Bitcoin Monster 223 | Market Oracle", page_icon="🐋", layout="wide")
+
+APP_NAME = "GARIBALDI MARKET ORACLE™"
+DEFAULT_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD"]
+DEFAULT_STOCKS = ["AAPL", "NVDA", "TSLA", "RKLB", "GLW", "PLTR"]
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 GaribaldiMarketOracle/1.0"})
+
+CRYPTO_IDS = {
+    "BTC-USD": "bitcoin", "ETH-USD": "ethereum", "SOL-USD": "solana",
+    "BNB-USD": "binancecoin", "XRP-USD": "ripple", "DOGE-USD": "dogecoin",
 }
+BINANCE = {"BTC-USD":"BTCUSDT", "ETH-USD":"ETHUSDT", "SOL-USD":"SOLUSDT", "BNB-USD":"BNBUSDT", "XRP-USD":"XRPUSDT", "DOGE-USD":"DOGEUSDT"}
 
-st.markdown("""
-<style>
-.stApp {background: #080b12; color: #f5f7fb;}
-.big-title {font-size: 50px; font-weight: 900; letter-spacing: 1px;}
-.card {padding: 18px; border-radius: 18px; background: #111827; border: 1px solid #263244;}
-.good {color:#5df28b; font-weight:800;} .bad {color:#ff5c7a; font-weight:800;} .warn {color:#f7c948; font-weight:800;}
-.small {color:#aeb7c2; font-size: 13px;}
-</style>
-""", unsafe_allow_html=True)
+def is_crypto(symbol: str) -> bool:
+    return symbol.upper() in CRYPTO_IDS or symbol.upper().endswith(("-USD", "USDT"))
 
-# ---------- DATA ----------
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_binance_klines(symbol: str, interval="1m", limit=240) -> pd.DataFrame:
-    pair = BINANCE_MAP.get(symbol)
-    if not pair:
-        return pd.DataFrame()
-    url = "https://api.binance.com/api/v3/klines"
-    r = requests.get(url, params={"symbol": pair, "interval": interval, "limit": limit}, timeout=10)
-    r.raise_for_status()
-    rows = r.json()
-    df = pd.DataFrame(rows, columns=["time","Open","High","Low","Close","Volume","close_time","qav","trades","tbav","tqav","ignore"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df[["time","Open","High","Low","Close","Volume"]].dropna()
-
-@st.cache_data(ttl=45, show_spinner=False)
-def fetch_yahoo(symbol: str, period="2d", interval="5m") -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False, threads=False)
+def normalize(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    df = df.reset_index()
-    time_col = "Datetime" if "Datetime" in df.columns else "Date"
-    df = df.rename(columns={time_col: "time"})
-    keep = ["time", "Open", "High", "Low", "Close", "Volume"]
-    return df[keep].dropna()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c not in df.columns:
+            df[c] = np.nan
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
-@st.cache_data(ttl=20, show_spinner=False)
-def get_market(symbol: str, source="Binance Live") -> pd.DataFrame:
-    try:
-        if source.startswith("Binance"):
-            df = fetch_binance_klines(symbol)
-            if not df.empty:
-                return df
-    except Exception:
-        pass
-    try:
-        return fetch_yahoo(symbol)
-    except Exception:
+def interval_to_binance(interval: str) -> str:
+    return {"5m":"5m", "15m":"15m", "1h":"1h", "1d":"1d"}.get(interval, "1h")
+
+def period_to_limit(period: str, interval: str) -> int:
+    days = {"1d":1, "5d":5, "1mo":30, "3mo":90, "6mo":180, "1y":365}.get(period, 5)
+    per_day = {"5m":288, "15m":96, "1h":24, "1d":1}.get(interval, 24)
+    return max(24, min(1000, days * per_day))
+
+def yahoo_chart(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    r = SESSION.get(url, params={"range": period, "interval": interval}, timeout=10)
+    r.raise_for_status()
+    result = (r.json().get("chart", {}).get("result") or [])
+    if not result:
         return pd.DataFrame()
+    item = result[0]
+    ts = item.get("timestamp") or []
+    q = (item.get("indicators", {}).get("quote") or [{}])[0]
+    df = pd.DataFrame({
+        "Datetime": pd.to_datetime(ts, unit="s", utc=True),
+        "Open": q.get("open") or [], "High": q.get("high") or [],
+        "Low": q.get("low") or [], "Close": q.get("close") or [],
+        "Volume": q.get("volume") or [],
+    }).set_index("Datetime")
+    return normalize(df)
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fear_greed():
+def binance_klines(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    pair = BINANCE.get(symbol.upper())
+    if not pair:
+        return pd.DataFrame()
+    url = "https://api.binance.us/api/v3/klines"
+    params = {"symbol": pair, "interval": interval_to_binance(interval), "limit": period_to_limit(period, interval)}
+    r = SESSION.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["open_time","Open","High","Low","Close","Volume","close_time","qv","trades","tb","tq","ignore"])
+    df["Datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return normalize(df.set_index("Datetime"))
+
+def coingecko_market_chart(symbol: str, period: str) -> pd.DataFrame:
+    coin = CRYPTO_IDS.get(symbol.upper())
+    if not coin:
+        return pd.DataFrame()
+    days = {"1d":1, "5d":5, "1mo":30, "3mo":90, "6mo":180, "1y":365}.get(period, 5)
+    url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart"
+    r = SESSION.get(url, params={"vs_currency":"usd", "days":days}, timeout=10)
+    r.raise_for_status()
+    prices = r.json().get("prices") or []
+    if not prices:
+        return pd.DataFrame()
+    df = pd.DataFrame(prices, columns=["ms", "Close"])
+    df["Datetime"] = pd.to_datetime(df["ms"], unit="ms", utc=True)
+    df["Open"] = df["High"] = df["Low"] = df["Close"]
+    df["Volume"] = np.nan
+    return normalize(df.set_index("Datetime"))
+
+def stooq_daily(symbol: str) -> pd.DataFrame:
+    # Free stock fallback; daily only. Not for crypto.
+    s = symbol.lower().replace(".", "-")
+    url = f"https://stooq.com/q/d/l/?s={s}.us&i=d"
+    r = SESSION.get(url, timeout=10)
+    r.raise_for_status()
+    if "No data" in r.text or len(r.text) < 40:
+        return pd.DataFrame()
+    from io import StringIO
+    df = pd.read_csv(StringIO(r.text))
+    if "Date" not in df.columns:
+        return pd.DataFrame()
+    df["Datetime"] = pd.to_datetime(df["Date"], utc=True)
+    df = df.rename(columns={"Open":"Open", "High":"High", "Low":"Low", "Close":"Close", "Volume":"Volume"})
+    return normalize(df.set_index("Datetime").tail(370))
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_history(symbol: str, period: str = "5d", interval: str = "1h") -> Tuple[pd.DataFrame, str]:
+    symbol = symbol.strip().upper()
+    attempts = []
+    providers = []
+    if yf is not None:
+        providers.append(("Yahoo yfinance", lambda: yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)))
+    providers.append(("Yahoo chart API", lambda: yahoo_chart(symbol, period, interval)))
+    if is_crypto(symbol):
+        providers.extend([
+            ("Binance.US public candles", lambda: binance_klines(symbol, period, interval)),
+            ("CoinGecko market chart", lambda: coingecko_market_chart(symbol, period)),
+        ])
+    else:
+        providers.append(("Stooq daily fallback", lambda: stooq_daily(symbol)))
+
+    for name, fn in providers:
+        try:
+            df = normalize(fn())
+            if not df.empty:
+                return df, name
+            attempts.append(f"{name}: empty")
+        except Exception as exc:
+            attempts.append(f"{name}: {str(exc)[:90]}")
+        time.sleep(0.05)
+    return pd.DataFrame(), " | ".join(attempts)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def spot_board(symbols: Tuple[str, ...]) -> pd.DataFrame:
+    rows = []
+    crypto = [s for s in symbols if s in CRYPTO_IDS]
+    if crypto:
+        try:
+            ids = ",".join(CRYPTO_IDS[s] for s in crypto)
+            r = SESSION.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":ids,"vs_currencies":"usd","include_24hr_change":"true","include_24hr_vol":"true"}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            rev = {v:k for k,v in CRYPTO_IDS.items()}
+            for cid, p in data.items():
+                rows.append({"Symbol": rev.get(cid, cid), "Price": p.get("usd"), "24h Change %": p.get("usd_24h_change"), "24h Volume": p.get("usd_24h_vol"), "Source": "CoinGecko"})
+        except Exception:
+            pass
+    return pd.DataFrame(rows)
+
+def oracle_metrics(df: pd.DataFrame, horizon_days: int = 5) -> Dict[str, Optional[float]]:
+    df = normalize(df)
+    if df.empty or len(df) < 3:
+        return {"spot": None, "target": None, "ceiling": None, "floor": None, "vol": None}
+    close = df["Close"].dropna()
+    ret = np.log(close / close.shift(1)).dropna()
+    spot = float(close.iloc[-1])
+    if ret.empty:
+        return {"spot": spot, "target": None, "ceiling": None, "floor": None, "vol": None}
+    mu, sigma = float(ret.mean()), float(ret.std() or 0)
+    target = spot * np.exp((mu - 0.5 * sigma**2) * horizon_days)
+    radius = sigma * np.sqrt(horizon_days)
+    return {"spot": spot, "target": target, "ceiling": target*np.exp(2*radius), "floor": target*np.exp(-2*radius), "vol": sigma}
+
+def signal(m: Dict[str, Optional[float]]) -> str:
+    if not m.get("spot") or not m.get("target"):
+        return "NO DATA"
+    edge = (m["target"] - m["spot"]) / m["spot"]
+    return "BULL WATCH" if edge > .035 else "RISK WATCH" if edge < -.035 else "NEUTRAL"
+
+def money(x):
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8).json()["data"][0]
-        return int(r["value"]), r["value_classification"]
+        x = float(x)
+        return f"${x:,.4f}" if abs(x) < 1 else f"${x:,.2f}"
     except Exception:
-        return None, "Unavailable"
+        return "—"
 
-# ---------- INDICATORS ----------
-def indicators(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    x["ret"] = x["Close"].pct_change()
-    x["ema9"] = x["Close"].ewm(span=9).mean()
-    x["ema21"] = x["Close"].ewm(span=21).mean()
-    delta = x["Close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    x["rsi"] = 100 - (100 / (1 + rs))
-    x["vol_ma"] = x["Volume"].rolling(20).mean()
-    x["vol_spike"] = x["Volume"] / x["vol_ma"]
-    ma20 = x["Close"].rolling(20).mean()
-    sd20 = x["Close"].rolling(20).std()
-    x["bb_hi"] = ma20 + 2 * sd20
-    x["bb_lo"] = ma20 - 2 * sd20
-    return x
+def pct(x):
+    try: return f"{float(x):.2f}%"
+    except Exception: return "—"
 
-def signal_engine(df: pd.DataFrame):
-    if df.empty or len(df) < 35:
-        return {"signal":"WAIT", "score":0, "reason":"Not enough live candles yet.", "target":None, "stop":None}
-    x = indicators(df).dropna()
-    if x.empty:
-        return {"signal":"WAIT", "score":0, "reason":"Indicators warming up.", "target":None, "stop":None}
-    last = x.iloc[-1]
-    prev = x.iloc[-2]
-    score = 0
-    reasons = []
-    if last.ema9 > last.ema21 and prev.ema9 <= prev.ema21:
-        score += 30; reasons.append("fresh EMA bullish cross")
-    elif last.ema9 > last.ema21:
-        score += 15; reasons.append("EMA trend bullish")
-    if 45 <= last.rsi <= 68:
-        score += 20; reasons.append("RSI healthy")
-    elif last.rsi < 32:
-        score += 10; reasons.append("RSI oversold bounce zone")
-    elif last.rsi > 75:
-        score -= 20; reasons.append("RSI overheated")
-    if last.vol_spike > 1.5 and last.Close > last.Open:
-        score += 25; reasons.append("bull volume spike")
-    if last.Close > last.bb_hi:
-        score += 10; reasons.append("breakout above Bollinger band")
-    if last.Close < last.bb_lo:
-        score -= 20; reasons.append("breakdown below Bollinger band")
-    if x.Close.iloc[-1] > x.Close.iloc[-20]:
-        score += 15; reasons.append("20-candle momentum up")
-    else:
-        score -= 10; reasons.append("20-candle momentum weak")
-
-    if score >= 55:
-        sig = "BUY / LONG"
-    elif score <= -20:
-        sig = "SELL / AVOID"
-    else:
-        sig = "WAIT"
-    price = float(last.Close)
-    vol = float(x.ret.tail(60).std() or 0.01)
-    target = price * (1 + max(0.008, vol * 3))
-    stop = price * (1 - max(0.006, vol * 2))
-    return {"signal":sig, "score":int(score), "reason":"; ".join(reasons), "target":target, "stop":stop}
-
-def forecast(df, steps=30):
-    if df.empty or len(df) < 20:
-        return None
-    close = df["Close"].astype(float)
-    rets = np.log(close / close.shift(1)).dropna()
-    drift = rets.mean() - 0.5 * rets.var()
-    vol = rets.std()
-    spot = close.iloc[-1]
-    target = spot * np.exp(drift * steps)
-    ceiling = target * np.exp(2 * vol * np.sqrt(steps))
-    floor = target * np.exp(-2 * vol * np.sqrt(steps))
-    bull_prob = float((rets.tail(50) > 0).mean() * 100)
-    return spot, target, ceiling, floor, bull_prob
-
-# ---------- PAPER BOT ----------
-def init_state():
-    if "cash" not in st.session_state:
-        st.session_state.cash = 10000.0
-        st.session_state.position = 0.0
-        st.session_state.avg_price = 0.0
-        st.session_state.trades = []
-init_state()
-
-def bot_trade(symbol, price, signal, qty_usd):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if signal.startswith("BUY") and st.session_state.cash >= qty_usd:
-        qty = qty_usd / price
-        old_val = st.session_state.position * st.session_state.avg_price
-        st.session_state.position += qty
-        st.session_state.avg_price = (old_val + qty_usd) / st.session_state.position
-        st.session_state.cash -= qty_usd
-        st.session_state.trades.append({"time":now,"symbol":symbol,"side":"PAPER BUY","price":price,"usd":qty_usd})
-    elif signal.startswith("SELL") and st.session_state.position > 0:
-        qty = st.session_state.position
-        usd = qty * price
-        st.session_state.cash += usd
-        st.session_state.position = 0.0
-        st.session_state.avg_price = 0.0
-        st.session_state.trades.append({"time":now,"symbol":symbol,"side":"PAPER SELL","price":price,"usd":usd})
-
-# ---------- UI ----------
-st.markdown('<div class="big-title">GARIBALDI CRYPTO PREDICTION BOT™ v3</div>', unsafe_allow_html=True)
-st.caption("Live market reports + AI signal engine + paper-trading bot. Educational tool only — not financial advice.")
+st.title(f"🐋 {APP_NAME}")
+st.caption("Multi-source Railway-safe market app: Yahoo/yfinance + Yahoo Chart + CoinGecko + Binance.US + Stooq. Failed providers are skipped, not crashed.")
 
 with st.sidebar:
-    st.header("Live Controls")
-    symbols = st.multiselect("Coins", DEFAULT_SYMBOLS, default=DEFAULT_SYMBOLS[:6])
-    focus = st.selectbox("Focus chart", symbols or DEFAULT_SYMBOLS, index=0)
-    source = st.selectbox("Market source", ["Binance Live", "Yahoo fallback"])
-    refresh_sec = st.slider("Auto-refresh seconds", 5, 120, 15)
-    paper_enabled = st.toggle("AI paper bot live mode", value=True)
-    trade_size = st.number_input("Paper trade size ($)", min_value=10.0, max_value=5000.0, value=250.0, step=10.0)
-    st.warning("Real-money trading is disabled by default. Use paper mode until API keys, exchange permissions, and risk limits are fully tested.")
+    st.header("Controls")
+    market_mode = st.radio("Market", ["Crypto", "Stocks", "Custom"], horizontal=True)
+    period = st.selectbox("History", ["1d", "5d", "1mo", "3mo", "6mo", "1y"], index=1)
+    interval = st.selectbox("Interval", ["5m", "15m", "1h", "1d"], index=2)
+    horizon = st.slider("Oracle horizon days", 1, 30, 5)
+    if st.button("Refresh now"):
+        st.cache_data.clear()
+    st.caption("Research/paper-trading only. Not financial advice.")
 
-st_autorefresh(interval=refresh_sec * 1000, key="live_refresh")
-
-fg_value, fg_class = fear_greed()
-
-# Live report table
-rows = []
-for sym in symbols:
-    df = get_market(sym, source)
-    if df.empty:
-        rows.append({"Symbol": sym, "Price": np.nan, "Change %": np.nan, "AI Signal":"NO DATA", "Score":0, "Target":np.nan, "Stop":np.nan})
-        continue
-    sig = signal_engine(df)
-    price = float(df["Close"].iloc[-1])
-    chg = (price / float(df["Close"].iloc[0]) - 1) * 100
-    fc = forecast(df)
-    target = sig["target"] if sig["target"] else (fc[1] if fc else np.nan)
-    stop = sig["stop"] if sig["stop"] else np.nan
-    rows.append({"Symbol": sym, "Price": price, "Change %": chg, "AI Signal": sig["signal"], "Score": sig["score"], "Target": target, "Stop": stop})
-
-live = pd.DataFrame(rows)
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Market Feed", "LIVE", f"refresh {refresh_sec}s")
-with c2:
-    st.metric("Fear & Greed", fg_class, fg_value if fg_value is not None else "--")
-with c3:
-    best = live.sort_values("Change %", ascending=False).iloc[0] if not live.empty else None
-    st.metric("Top Mover", best["Symbol"] if best is not None else "--", f"{best['Change %']:.2f}%" if best is not None and pd.notna(best['Change %']) else "--")
-with c4:
-    st.metric("Paper Cash", f"${st.session_state.cash:,.2f}")
-
-st.subheader("Live Market Report")
-st.dataframe(live, use_container_width=True, hide_index=True)
-
-# Focus chart and signal
-st.subheader(f"Live AI Chart: {focus}")
-df_focus = get_market(focus, source)
-if df_focus.empty:
-    st.error("No market data loaded. Try another symbol or wait for refresh.")
+if market_mode == "Crypto":
+    symbols = DEFAULT_SYMBOLS
+elif market_mode == "Stocks":
+    symbols = DEFAULT_STOCKS
 else:
-    x = indicators(df_focus)
-    sig = signal_engine(df_focus)
-    price = float(df_focus["Close"].iloc[-1])
-    if paper_enabled:
-        bot_trade(focus, price, sig["signal"], float(trade_size))
+    raw = st.text_input("Enter tickers separated by commas", "BTC-USD, ETH-USD, GLW, NVDA")
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-    left, right = st.columns([2, 1])
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=x["time"], open=x["Open"], high=x["High"], low=x["Low"], close=x["Close"], name="Price"))
-        fig.add_trace(go.Scatter(x=x["time"], y=x["ema9"], name="EMA 9"))
-        fig.add_trace(go.Scatter(x=x["time"], y=x["ema21"], name="EMA 21"))
-        fig.update_layout(height=520, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=25,b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        klass = "good" if sig["signal"].startswith("BUY") else "bad" if sig["signal"].startswith("SELL") else "warn"
-        st.markdown(f'<div class="card"><h2 class="{klass}">{sig["signal"]}</h2><p>AI score: <b>{sig["score"]}</b></p><p>{sig["reason"]}</p><hr><p>Price: ${price:,.4f}</p><p>Target: ${sig["target"]:,.4f}</p><p>Stop: ${sig["stop"]:,.4f}</p></div>', unsafe_allow_html=True)
+feed = spot_board(tuple(symbols))
+if not feed.empty:
+    st.subheader("Live spot fallback feed")
+    view = feed.copy()
+    view["Price"] = view["Price"].map(money)
+    view["24h Change %"] = view["24h Change %"].map(pct)
+    st.dataframe(view, use_container_width=True, hide_index=True)
 
-        fc = forecast(df_focus)
-        if fc:
-            spot, target, ceiling, floor, bull = fc
-            st.metric("Forecast target", f"${target:,.4f}")
-            st.metric("Bull probability", f"{bull:.0f}%")
+st.subheader("Oracle board")
+rows, histories, sources = [], {}, {}
+with st.spinner("Trying every available market source safely..."):
+    for sym in symbols:
+        df, src = load_history(sym, period, interval)
+        histories[sym], sources[sym] = df, src
+        m = oracle_metrics(df, horizon)
+        rows.append({"Symbol": sym, "Spot": money(m["spot"]), "Target": money(m["target"]), "Floor": money(m["floor"]), "Ceiling": money(m["ceiling"]), "Signal": signal(m), "Provider Used / Status": src if not df.empty else "NO DATA: " + src})
 
-    tabs = st.tabs(["AI Bot", "Alerts", "Portfolio", "Developer / Real Trading Hook"])
-    with tabs[0]:
-        st.write("The bot reacts every refresh using trend, momentum, RSI, Bollinger breakout, and volume-spike logic.")
-        st.write("Mode:", "🟢 Paper bot running" if paper_enabled else "Paused")
-        if st.button("Manual PAPER BUY"):
-            bot_trade(focus, price, "BUY / LONG", float(trade_size))
-        if st.button("Manual PAPER SELL"):
-            bot_trade(focus, price, "SELL / AVOID", float(trade_size))
-    with tabs[1]:
-        alerts = []
-        last = x.dropna().iloc[-1]
-        if last.rsi > 70: alerts.append("RSI overbought: possible pullback risk")
-        if last.rsi < 30: alerts.append("RSI oversold: possible bounce zone")
-        if last.vol_spike > 1.8: alerts.append("Unusual volume spike detected")
-        if last.Close > last.bb_hi: alerts.append("Breakout above upper Bollinger band")
-        if last.Close < last.bb_lo: alerts.append("Breakdown below lower Bollinger band")
-        if not alerts: alerts = ["No major alerts right now."]
-        for a in alerts:
-            st.info(a)
-    with tabs[2]:
-        value = st.session_state.cash + st.session_state.position * price
-        pnl = value - 10000
-        st.metric("Paper portfolio value", f"${value:,.2f}", f"${pnl:,.2f}")
-        st.metric("Position", f"{st.session_state.position:.6f} {focus.replace('-USD','')}")
-        if st.session_state.trades:
-            st.dataframe(pd.DataFrame(st.session_state.trades), use_container_width=True, hide_index=True)
-        if st.button("Reset paper portfolio"):
-            st.session_state.cash = 10000.0; st.session_state.position = 0.0; st.session_state.avg_price = 0.0; st.session_state.trades = []
-            st.rerun()
-    with tabs[3]:
-        st.code('''# Real trading is intentionally disabled.\n# To add it later:\n# 1) Create exchange account API keys with withdrawal disabled.\n# 2) Store keys in Railway Variables, never in GitHub.\n# 3) Require max daily loss, max trade size, and manual kill switch.\n# 4) Paper trade for at least 30 days before live execution.\n\nEXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")\nEXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET")\nREAL_TRADING_ENABLED = os.getenv("REAL_TRADING_ENABLED") == "true"\n''', language="python")
+st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-st.divider()
-st.caption(f"Last run: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | Educational tool only, not financial advice. Live trading requires separate exchange setup and risk controls.")
+left, right = st.columns([2, 1])
+with left:
+    selected = st.selectbox("Chart symbol", symbols)
+    df = histories.get(selected, pd.DataFrame())
+    if df.empty:
+        st.warning(f"No chart data for {selected}. App is healthy; all providers failed or timed out.")
+    else:
+        st.line_chart(df["Close"], use_container_width=True)
+with right:
+    st.metric("App status", "Healthy")
+    st.write("Last refresh UTC:", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    st.write("Selected source:", sources.get(selected, "—"))
+    st.info("Deploy-safe: cached requests, multiple fallbacks, no startup crash, no broker live-trading without manual approval.")
+
+st.subheader("Provider order")
+st.code("Yahoo yfinance → Yahoo Chart API → crypto: Binance.US → crypto: CoinGecko → stocks: Stooq daily fallback", language="text")

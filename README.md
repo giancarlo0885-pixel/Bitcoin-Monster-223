@@ -1,15 +1,15 @@
-# Garibaldi Crypto Prediction Bot v3
+# Bitcoin Monster 223 — Railway Fixed
 
-Railway-ready Streamlit app with live market reports, AI signal engine, paper-trading bot, alerts, and optional exchange API placeholder.
+Railway-safe Streamlit market dashboard.
 
-## Railway Start Command
+## Data provider fallback order
+
+Yahoo yfinance → Yahoo Chart API → Binance.US crypto candles → CoinGecko crypto chart/spot → Stooq daily stock fallback.
+
+The app does not crash if one provider blocks, times out, or returns empty data.
+
+## Railway start command
 
 ```bash
 streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
 ```
-
-## Notes
-
-- Live reporting uses public market data refreshes.
-- Live trading is paper-trading by default.
-- Real-money execution requires exchange API keys and extra safety checks.
